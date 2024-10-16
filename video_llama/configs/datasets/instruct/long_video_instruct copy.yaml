@@ -1,0 +1,7 @@
+datasets:
+  long_video_instruct:
+    data_type: video
+    build_info:
+      #Replace yours
+      anno_dir: /media/scratch/saul/MovieNet/OpenDataLab___MovieNet/raw/annotations.json
+      videos_dir: /media/scratch/saul/MovieNet/OpenDataLab___MovieNet/raw/240P/

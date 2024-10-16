@@ -44,7 +44,7 @@ llama_v2_video_conversation = Conversation(
 IGNORE_INDEX = -100
 
 class Long_Video_Instruct_Dataset(BaseDataset):
-    def __init__(self, vis_processor, text_processor, vis_root, ann_root,num_video_query_token=32,tokenizer_name = '/mnt/workspace/ckpt/vicuna-13b/',data_type = 'video', model_type='vicuna'):
+    def __init__(self, vis_processor, text_processor, vis_root, ann_root, subt_root, num_video_query_token=32,tokenizer_name = '/mnt/workspace/ckpt/vicuna-13b/',data_type = 'video', model_type='vicuna'):
         """
         vis_root (string): Root directory of Llava images (e.g. webvid_eval/video/)
         ann_root (string): Root directory of video (e.g. webvid_eval/annotations/)
@@ -58,6 +58,7 @@ class Long_Video_Instruct_Dataset(BaseDataset):
 
         self.num_video_query_token = num_video_query_token
         self.vis_root = vis_root
+        self.subtitle_path = subt_root
         self.resize_size = 224
         self.num_frm = 8
         self.tokenizer = LlamaTokenizer.from_pretrained(tokenizer_name, use_fast=False)
@@ -75,7 +76,7 @@ class Long_Video_Instruct_Dataset(BaseDataset):
         rel_video_fp = sample['video']
         full_video_fp = os.path.join(self.vis_root,  rel_video_fp)
         return full_video_fp
-    
+
     def load_video(self, video_path, height, width):
         video_file = tarfile.open(video_path, 'r')
         image_file = [x for x in video_file.getmembers() if '.jpg' in x.name]
@@ -97,7 +98,8 @@ class Long_Video_Instruct_Dataset(BaseDataset):
 
                 video_path = self._get_video_path(sample)
                 conversation_list = sample['conversations']
-
+                id = sample["video"].replace("/", "").replace(".tar", "")
+                id = self.subtitle_path + id + ".srt"
                 video, msg = load_video(
                     video_path=video_path,
                     height=self.resize_size,
@@ -107,7 +109,7 @@ class Long_Video_Instruct_Dataset(BaseDataset):
                 if 'cn' in self.data_type:
                     msg = ""
                 # 添加视频<DEFAULT_IMAGE_PATCH_TOKEN>,以及msg到convsation list 0
-                new_sources = preprocess_multimodal(copy.deepcopy(conversation_list), None, cur_token_len=self.num_video_query_token, msg=msg)
+                new_sources = preprocess_multimodal(copy.deepcopy(conversation_list), None, cur_token_len=self.num_video_query_token, msg=msg, id=id)
                 
                 if self.model_type =='vicuna':
                     data_dict = preprocess(
@@ -168,17 +170,50 @@ class Long_Video_Instruct_Dataset(BaseDataset):
         batch['conv_type'] = 'multi'
         return batch
 
+def load_subtitles(file_path):
+    def check(subtitle):
+        # We only check if subtitle text is not None
+        return subtitle.get('text', None) is not None 
+
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+        lines = file.readlines()
+
+    subtitle = ''
+    
+    for line in lines:
+        line = line.replace('\x00', '').strip()
+        line = line.replace('...', '').strip()
+        if not line:
+            continue
+        
+        if line.isdigit():
+            # Skip if we reach a digit line (subtitle number)
+            continue
+        elif ' --> ' in line:
+            # Skip start and end times
+            continue
+        else:
+            if subtitle:
+                subtitle += ' ' + line  # Concatenate with a space
+            else:
+                subtitle = line  # Initialize with the first line of text
+    
+    return subtitle  # Return the complete string of subtitles
+
 def preprocess_multimodal(
     conversation_list: Sequence[str],
     multimodal_cfg: dict,
     cur_token_len: int,
-    msg=''
+    msg='',
+    id=""
 ) -> Dict:
     # 将conversational list中
     is_multimodal = True
     # image_token_len = multimodal_cfg['image_token_len']
     image_token_len = cur_token_len
-    conversation_list[0]["value"] = conversation_list[0]["value"].replace("<image>", "<Video>"+DEFAULT_IMAGE_PATCH_TOKEN * image_token_len +"</Video> " + msg)
+    subtitles = load_subtitles(id)
+    split = conversation_list[0]["value"].split("<image>")
+    conversation_list[0]["value"] = split[0] + "<Video>"+DEFAULT_IMAGE_PATCH_TOKEN * image_token_len +"</Video>" + "\n" + subtitles + split[1] + msg
     return [conversation_list]
 
 def _add_speaker_and_signal(header, source, get_conversation=True):

@@ -7,6 +7,7 @@ from video_llama.datasets.builders.base_dataset_builder import BaseDatasetBuilde
 from video_llama.datasets.datasets.laion_dataset import LaionDataset
 from video_llama.datasets.datasets.llava_instruct_dataset import Instruct_Dataset
 from video_llama.datasets.datasets.video_instruct_dataset import Video_Instruct_Dataset
+from video_llama.datasets.datasets.long_video_instruct_dataset import Long_Video_Instruct_Dataset
 
 @registry.register_builder("instruct")
 class Instruct_Builder(BaseDatasetBuilder):
@@ -37,19 +38,39 @@ class Instruct_Builder(BaseDatasetBuilder):
         else:
             tokenizer_name = '/mnt/workspace/ckpt/vicuna-13b/'
 
-
-        datasets[split] = dataset_cls(
-            vis_processor=self.vis_processors[split],
-            text_processor=self.text_processors[split],
-            vis_root=build_info.videos_dir,
-            ann_root=build_info.anno_dir,
-            num_video_query_token = num_video_query_token,
-            tokenizer_name = tokenizer_name,
-            data_type = self.config.data_type,
-            model_type = self.config.model_type
-        )
-
+        try:
+            path = build_info.subt_dir
+            datasets[split] = dataset_cls(
+                vis_processor=self.vis_processors[split],
+                text_processor=self.text_processors[split],
+                vis_root=build_info.videos_dir,
+                ann_root=build_info.anno_dir,
+                subt_root=path,
+                num_video_query_token = num_video_query_token,
+                tokenizer_name = tokenizer_name,
+                data_type = self.config.data_type,
+                model_type = self.config.model_type
+            )
+        except:
+                datasets[split] = dataset_cls(
+                vis_processor=self.vis_processors[split],
+                text_processor=self.text_processors[split],
+                vis_root=build_info.videos_dir,
+                ann_root=build_info.anno_dir,
+                num_video_query_token = num_video_query_token,
+                tokenizer_name = tokenizer_name,
+                data_type = self.config.data_type,
+                model_type = self.config.model_type
+            )
         return datasets
+
+@registry.register_builder("long_video_instruct")
+class Long_Video_Instruct_Builder(Instruct_Builder):
+    train_dataset_cls = Long_Video_Instruct_Dataset
+
+    DATASET_CONFIG_DICT = {
+        "default": "configs/datasets/instruct/long_video_instruct.yaml",
+    }
 
 @registry.register_builder("webvid_instruct")
 class WebvidInstruct_Builder(Instruct_Builder):
