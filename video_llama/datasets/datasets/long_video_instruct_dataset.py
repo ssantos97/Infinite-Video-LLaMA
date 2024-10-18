@@ -19,7 +19,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaTokenizer
 import copy
 from video_llama.processors import transforms_video,AlproVideoTrainProcessor
 from torchvision import transforms
-from video_llama.processors.video_processor import ToTHWC,ToUint8,load_video
+from video_llama.processors.video_processor import ToTHWC,ToUint8
 from video_llama.conversation.conversation_video import Conversation,SeparatorStyle
 
 DEFAULT_IMAGE_PATCH_TOKEN = '<ImageHere>'
@@ -81,7 +81,7 @@ class Long_Video_Instruct_Dataset(BaseDataset):
         video_file = tarfile.open(video_path, 'r')
         image_file = [x for x in video_file.getmembers() if '.jpg' in x.name]
         image_data = [video_file.extractfile(x).read() for x in image_file]
-        image_data = [torch.from_numpy(np.array(Image.open(io.BytesIO(x)).resize(height, width))).permute(2, 0, 1).unsqueeze(1) for x in image_data]
+        image_data = [torch.from_numpy(np.array(Image.open(io.BytesIO(x)).resize((width, height)))).permute(2, 0, 1) for x in image_data]
 
         file_name = [x.name for x in image_file]
         indexed_list = list(enumerate(file_name))
@@ -100,7 +100,7 @@ class Long_Video_Instruct_Dataset(BaseDataset):
                 conversation_list = sample['conversations']
                 id = sample["video"].replace("/", "").replace(".tar", "")
                 id = self.subtitle_path + id + ".srt"
-                video, msg = load_video(
+                video, msg = self.load_video(
                     video_path=video_path,
                     height=self.resize_size,
                     width=self.resize_size,
@@ -171,13 +171,8 @@ class Long_Video_Instruct_Dataset(BaseDataset):
         return batch
 
 def load_subtitles(file_path):
-    def check(subtitle):
-        # We only check if subtitle text is not None
-        return subtitle.get('text', None) is not None 
-
     with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
         lines = file.readlines()
-
     subtitle = ''
     
     for line in lines:
@@ -197,7 +192,6 @@ def load_subtitles(file_path):
                 subtitle += ' ' + line  # Concatenate with a space
             else:
                 subtitle = line  # Initialize with the first line of text
-    
     return subtitle  # Return the complete string of subtitles
 
 def preprocess_multimodal(
@@ -244,7 +238,7 @@ def _tokenize_fn(strings: Sequence[str],
             text,
             return_tensors="pt",
             padding="longest",
-            max_length=512,
+            max_length=100000,
             truncation=True,
         ) for text in strings
     ]
@@ -324,7 +318,7 @@ def preprocess_for_llama_v2(
             conversations,
             return_tensors="pt",
             padding="longest",
-            max_length=512,
+            max_length=100000,
             truncation=True,
         ).input_ids
     targets = copy.deepcopy(input_ids)

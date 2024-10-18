@@ -21,7 +21,8 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
-
+import einops
+from functools import partial
 from transformers.activations import ACT2FN
 from transformers.file_utils import (
     ModelOutput,
@@ -45,6 +46,8 @@ from transformers.modeling_utils import (
 )
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
+
+from video_llama.models.long_term_attention import LongTermAttention
 
 logger = logging.get_logger(__name__)
 
@@ -120,16 +123,39 @@ class BertSelfAttention(nn.Module):
                 "The hidden size (%d) is not a multiple of the number of attention "
                 "heads (%d)" % (config.hidden_size, config.num_attention_heads)
             )
-
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-
+        self.is_cross_attention=is_cross_attention
+        self.is_video_qformer = config.sticky is not None
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
         if is_cross_attention:
+            long_term_attn_mechanism = partial(LongTermAttention,
+                                    attn_num_basis=config.num_basis,
+                                    head_size=768,
+                                    length=config.encoder_width,
+                                    target_len=config.encoder_width,
+                                    attn_func="softmax",
+                                    infinite_memory=True,
+                                    n_layers=2,
+                                    attn_drop=0.1,
+                                    n_heads=1,
+                                    d_model=768,
+                                    affines=True,
+                                    mask=True,
+                                    mask_type="cnn",
+                                    kl_regularizer=False,
+                                    sigma_0=None,
+                                    mu_0=None,
+                                    sticky_memories=config.sticky,
+                                    continuous=True,
+                                    sigmas = config.sigmas,
+                                    tau = config.tau
+                                    )
+            self.long_term_attention=long_term_attn_mechanism()
             self.key = nn.Linear(config.encoder_width, self.all_head_size)
             self.value = nn.Linear(config.encoder_width, self.all_head_size)
-        else:
+        if not is_cross_attention:
             self.key = nn.Linear(config.hidden_size, self.all_head_size)
             self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
@@ -170,19 +196,34 @@ class BertSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states,
+        position_embedding_ext,
+        layer,
         attention_mask=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        new_video=False,
     ):
 
         # If this is instantiated as a cross-attention module, the keys
         # and values come from an encoder; the attention mask needs to be
         # such that the encoder's padding tokens are not attended to.
-        is_cross_attention = encoder_hidden_states is not None
-
+        is_cross_attention = self.is_cross_attention
+        long_att_enc_hidden_states = encoder_hidden_states
+        if layer == 0 and encoder_hidden_states is not None and position_embedding_ext is not None:
+            bsz, p, h = encoder_hidden_states.shape
+            n_frames = position_embedding_ext.shape[1]
+            encoder_hidden_states = encoder_hidden_states.reshape(bsz, n_frames, -1, h) + position_embedding_ext.unsqueeze(2)
+            encoder_hidden_states= encoder_hidden_states.reshape(bsz, p, h)  #[b t q h]
+        
+        if is_cross_attention and self.is_video_qformer:
+            bsz, p, h = long_att_enc_hidden_states.shape
+            self.long_term_attention.length = p
+            self.long_term_attention.target_len=p
+            a_long_term= self.long_term_attention(long_att_enc_hidden_states, hidden_states, new_doc=new_video, layer_n=layer) 
+            
         if is_cross_attention:
             key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
             value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
@@ -196,10 +237,9 @@ class BertSelfAttention(nn.Module):
             key_layer = self.transpose_for_scores(self.key(hidden_states))
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
-        mixed_query_layer = self.query(hidden_states)
+        mixed_query_layer = self.query(hidden_states) #[1, 32, 768]
 
-        query_layer = self.transpose_for_scores(mixed_query_layer)
-
+        query_layer = self.transpose_for_scores(mixed_query_layer)#[1,12,32,64]
         past_key_value = (key_layer, value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
@@ -262,12 +302,12 @@ class BertSelfAttention(nn.Module):
         if head_mask is not None:
             attention_probs_dropped = attention_probs_dropped * head_mask
 
-        context_layer = torch.matmul(attention_probs_dropped, value_layer)
-
+        context_layer = torch.matmul(attention_probs_dropped, value_layer) #[1, 12, 32, 64]
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
-
+        if is_cross_attention and self.is_video_qformer:
+            context_layer = context_layer + a_long_term 
         outputs = (
             (context_layer, attention_probs) if output_attentions else (context_layer,)
         )
@@ -323,21 +363,27 @@ class BertAttention(nn.Module):
     def forward(
         self,
         hidden_states,
+        position_embedding_ext,
+        layer,
         attention_mask=None,
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        new_video=False,
     ):
         self_outputs = self.self(
             hidden_states,
+            position_embedding_ext,
+            layer,
             attention_mask,
             head_mask,
             encoder_hidden_states,
             encoder_attention_mask,
             past_key_value,
             output_attentions,
+            new_video=new_video,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
 
@@ -399,10 +445,12 @@ class BertLayer(nn.Module):
 
         self.intermediate_query = BertIntermediate(config)
         self.output_query = BertOutput(config)
-
+        
     def forward(
         self,
         hidden_states,
+        position_embedding_ext,
+        layer,
         attention_mask=None,
         head_mask=None,
         encoder_hidden_states=None,
@@ -410,6 +458,7 @@ class BertLayer(nn.Module):
         past_key_value=None,
         output_attentions=False,
         query_length=0,
+        new_video=False,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = (
@@ -417,10 +466,13 @@ class BertLayer(nn.Module):
         )
         self_attention_outputs = self.attention(
             hidden_states,
+            position_embedding_ext,
+            layer,
             attention_mask,
             head_mask,
             output_attentions=output_attentions,
             past_key_value=self_attn_past_key_value,
+            new_video=new_video,
         )
         attention_output = self_attention_outputs[0]
         outputs = self_attention_outputs[1:-1]
@@ -436,11 +488,14 @@ class BertLayer(nn.Module):
                 ), "encoder_hidden_states must be given for cross-attention layers"
                 cross_attention_outputs = self.crossattention(
                     query_attention_output,
+                    position_embedding_ext,
+                    layer,
                     attention_mask,
                     head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
                     output_attentions=output_attentions,
+                    new_video=new_video,
                 )
                 query_attention_output = cross_attention_outputs[0]
                 outputs = (
@@ -496,6 +551,7 @@ class BertEncoder(nn.Module):
     def forward(
         self,
         hidden_states,
+        position_embedding_ext,
         attention_mask=None,
         head_mask=None,
         encoder_hidden_states=None,
@@ -506,6 +562,7 @@ class BertEncoder(nn.Module):
         output_hidden_states=False,
         return_dict=True,
         query_length=0,
+        new_video=False,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -542,14 +599,19 @@ class BertEncoder(nn.Module):
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer_module),
                     hidden_states,
+                    position_embedding_ext,
+                    i,
                     attention_mask,
                     layer_head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
+                    new_video=new_video
                 )
             else:
                 layer_outputs = layer_module(
                     hidden_states,
+                    position_embedding_ext,
+                    i,
                     attention_mask,
                     layer_head_mask,
                     encoder_hidden_states,
@@ -557,6 +619,7 @@ class BertEncoder(nn.Module):
                     past_key_value,
                     output_attentions,
                     query_length,
+                    new_video=new_video,
                 )
 
             hidden_states = layer_outputs[0]
@@ -805,6 +868,7 @@ class BertModel(BertPreTrainedModel):
     def forward(
         self,
         input_ids=None,
+        position_embedding_ext=None,
         attention_mask=None,
         position_ids=None,
         head_mask=None,
@@ -817,6 +881,7 @@ class BertModel(BertPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         is_decoder=False,
+        new_video=False,
     ):
         r"""
         encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
@@ -934,9 +999,9 @@ class BertModel(BertPreTrainedModel):
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
-
         encoder_outputs = self.encoder(
             embedding_output,
+            position_embedding_ext,
             attention_mask=extended_attention_mask,
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
@@ -947,6 +1012,7 @@ class BertModel(BertPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             query_length=query_length,
+            new_video = new_video
         )
         sequence_output = encoder_outputs[0]
         pooled_output = (

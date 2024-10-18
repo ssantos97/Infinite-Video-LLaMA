@@ -5,3 +5,4 @@ datasets:
       #Replace yours
       anno_dir: /media/scratch/saul/MovieNet/OpenDataLab___MovieNet/raw/annotations.json
       videos_dir: /media/scratch/saul/MovieNet/OpenDataLab___MovieNet/raw/240P/
+      subt_dir: /media/scratch/saul/MovieNet/OpenDataLab___MovieNet/subtitle/

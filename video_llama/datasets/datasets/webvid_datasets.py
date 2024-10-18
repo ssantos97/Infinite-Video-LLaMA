@@ -50,7 +50,6 @@ class WebvidDataset(BaseDataset):
             sample = self.annotation.iloc[index]
             sample_dict = sample.to_dict()
             video_id = sample_dict['videoid']
-
             if 'name' in sample_dict.keys():
                 text = sample_dict['name'].strip()
             else:

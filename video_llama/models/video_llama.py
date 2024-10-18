@@ -4,6 +4,7 @@ import random
 import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
+import torch.nn.functional as F
 
 from video_llama.common.registry import registry
 from video_llama.models.blip2 import Blip2Base, disabled_train
@@ -16,7 +17,28 @@ import copy
 from video_llama.models.Qformer import BertConfig, BertLMHeadModel
 from video_llama.models.ImageBind.models.imagebind_model import ImageBindModel,ModalityType
 from video_llama.models.ImageBind.models import imagebind_model
+from video_llama.models.hflayers import HopfieldPooling
 # from flamingo_pytorch import PerceiverResampler
+class AttentionPooling(nn.Module):
+    def __init__(self, feature_dim):
+        super(AttentionPooling, self).__init__()
+        self.query = nn.Parameter(torch.randn(feature_dim))  # Learnable query vector
+
+    def forward(self, x):
+        # x is expected to be of shape [batch_size, num_chunks, feature_dim]
+        
+        # Compute attention scores by taking the dot product of the query with the input
+        # x needs to be reshaped to [batch_size, num_chunks, feature_dim]
+        attention_scores = torch.matmul(x, self.query)  # Shape: [batch_size, num_chunks]
+        
+        # Apply softmax to get attention weights
+        attention_weights = F.softmax(attention_scores, dim=1)  # Shape: [batch_size, num_chunks]
+        
+        # Compute the weighted average of the chunks
+        pooled_output = torch.bmm(attention_weights.unsqueeze(1), x).squeeze(1)  # Shape: [batch_size, feature_dim]
+
+        return pooled_output
+
 @registry.register_model("video_llama")
 class VideoLLAMA(Blip2Base):
     """
@@ -29,7 +51,7 @@ class VideoLLAMA(Blip2Base):
     }
 
     @classmethod
-    def init_video_Qformer(cls, num_query_token, vision_width,num_hidden_layers =2):
+    def init_video_Qformer(cls, num_query_token, vision_width,num_hidden_layers =2, sticky=True, num_basis=256, sigmas = [0.005, 0.01], tau = 0.75):
         encoder_config = BertConfig.from_pretrained("bert-base-uncased")
         encoder_config.num_hidden_layers = num_hidden_layers
         encoder_config.encoder_width = vision_width
@@ -37,6 +59,10 @@ class VideoLLAMA(Blip2Base):
         encoder_config.add_cross_attention = True
         encoder_config.cross_attention_freq = 1
         encoder_config.query_length = num_query_token
+        encoder_config.sticky = sticky
+        encoder_config.num_basis = num_basis
+        encoder_config.sigmas = sigmas
+        encoder_config.tau = tau
         Qformer = BertLMHeadModel(config=encoder_config)
         query_tokens = nn.Parameter(
             torch.zeros(1, num_query_token, encoder_config.hidden_size)
@@ -74,13 +100,20 @@ class VideoLLAMA(Blip2Base):
         num_video_query_token = 32,
         num_audio_query_token = 8,
         imagebind_ckpt_path = '/mnt/workspace/ckpt',
-        equip_audio_branch = True
+        equip_audio_branch = True,
+
+        sticky=True,
+        num_basis = 256,
+        sigmas= [0.005, 0.01],
+        tau = 0.75,
+
+        short_term_memory_length=512
     ):
         super().__init__()
 
         self.tokenizer = self.init_tokenizer()
         self.low_resource = low_resource
-
+        self.L = short_term_memory_length
         print('Loading VIT')
         self.visual_encoder, self.ln_vision = self.init_vision_encoder(
             vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
@@ -183,11 +216,11 @@ class VideoLLAMA(Blip2Base):
         else:
             self.prompt_list = []
 
-        self.video_frame_position_embedding = nn.Embedding(max_frame_pos, self.Qformer.config.hidden_size)
+        self.video_frame_position_embeddings = nn.Embedding(max_frame_pos, self.Qformer.config.hidden_size)
 
         self.num_video_query_token = num_video_query_token
         self.video_Qformer,self.video_query_tokens = self.init_video_Qformer(num_query_token = num_video_query_token,\
-            vision_width=self.Qformer.config.hidden_size, num_hidden_layers =2)
+            vision_width=self.Qformer.config.hidden_size, num_hidden_layers =2, sticky = sticky, num_basis= num_basis, sigmas= sigmas, tau = tau)
 
         self.video_Qformer.cls = None
         self.video_Qformer.bert.embeddings.word_embeddings = None
@@ -196,12 +229,14 @@ class VideoLLAMA(Blip2Base):
             layer.output = None
             layer.intermediate = None
 
-
+        self.hopfield_pooling = AttentionPooling(
+            feature_dim=int(32*4096))
+        
         if frozen_video_Qformer:
             #  todo frozen  llama_proj
             for name, param in self.video_Qformer.named_parameters():
                 param.requires_grad = False
-            for name, param in self.video_frame_position_embedding.named_parameters():
+            for name, param in self.video_frame_position_embeddings.named_parameters():
                 param.requires_grad = False
             self.video_query_tokens.requires_grad = False
             
@@ -209,7 +244,7 @@ class VideoLLAMA(Blip2Base):
         else:
             for name, param in self.video_Qformer.named_parameters():
                 param.requires_grad = True
-            for name, param in self.video_frame_position_embedding.named_parameters():
+            for name, param in self.video_frame_position_embeddings.named_parameters():
                 param.requires_grad = True
             self.video_query_tokens.requires_grad = True
             logging.info('video_Qformer is not frozen')
@@ -235,6 +270,7 @@ class VideoLLAMA(Blip2Base):
             print ('audio encoder initialized.')
             
             self.num_audio_query_token = num_audio_query_token
+            #Adapt this in case we want to extend our chunk approach to audio
             self.audio_Qformer,self.audio_query_tokens = self.init_video_Qformer(num_query_token = self.num_audio_query_token,\
                 vision_width=self.audio_hidden_size, num_hidden_layers =2)
             self.audio_Qformer.cls = None
@@ -276,7 +312,7 @@ class VideoLLAMA(Blip2Base):
         self.visual_encoder.to("cpu")
         self.visual_encoder.float()
 
-    def encode_videoQformer_visual(self, image):
+    def encode_videoQformer_visual(self, image, new_video):
         device = image.device
         
         # input shape b,c,t,h,w
@@ -293,12 +329,13 @@ class VideoLLAMA(Blip2Base):
                 encoder_hidden_states=image_embeds,
                 encoder_attention_mask=image_atts,
                 return_dict=True,
+                new_video=new_video,
             )
 
             # add frame_pos embedding
             position_ids = torch.arange(time_length, dtype=torch.long, device=query_tokens.device)
             position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-            frame_position_embeddings = self.video_frame_position_embedding(position_ids)
+            frame_position_embeddings = self.video_frame_position_embeddings(position_ids)
             q_hidden_state = query_output.last_hidden_state
 
             frame_position_embeddings = frame_position_embeddings.unsqueeze(-2)
@@ -341,7 +378,7 @@ class VideoLLAMA(Blip2Base):
         else:
             return img_embeds, atts_img
     #  input audio shape [b t c h w] 
-    def encode_audioQformer(self, audio,modality_type=ModalityType.AUDIO):
+    def encode_audioQformer(self, audio,modality_type=ModalityType.AUDIO, new_video = False):
         device = audio.device
         with self.maybe_autocast():
             audio_feature, audio_imagebind_finalout = self.audio_encoder.get_audio_feature(audio,modality_type=modality_type)
@@ -362,6 +399,7 @@ class VideoLLAMA(Blip2Base):
                 encoder_hidden_states=audio_imagebind_finalout,
                 encoder_attention_mask=frame_atts,
                 return_dict=True,
+                new_video=new_video
                 )
             audio_hidden = audio_query_output.last_hidden_state
 
@@ -379,6 +417,7 @@ class VideoLLAMA(Blip2Base):
         with self.maybe_autocast():
             # embed image features with blip2, out: (b t) q h
             image_embeds = self.ln_vision(self.visual_encoder(image)).to(device)
+
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
 
             query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -392,7 +431,7 @@ class VideoLLAMA(Blip2Base):
             # add frame_pos embedding
             position_ids = torch.arange(time_length, dtype=torch.long, device=query_tokens.device)
             position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-            frame_position_embeddings = self.video_frame_position_embedding(position_ids)
+            frame_position_embeddings = self.video_frame_position_embeddings(position_ids)
             q_hidden_state = query_output.last_hidden_state
 
             frame_position_embeddings = frame_position_embeddings.unsqueeze(-2)
@@ -425,22 +464,32 @@ class VideoLLAMA(Blip2Base):
 
     def forward(self, samples):
         if 'conv_type' in samples.keys() and samples['conv_type']=='multi':
-            
             im_patch_token_id = self.IMAGE_PATCH_TOKEN_ID
             image = samples["images"]
             input_ids = samples['input_ids']
-            if len(image.size())==4:
+            
+            if len(image.size())==4 and image is not list:
                 time = 1
                 image = einops.repeat(image, 'b c h w -> b c t h w',t = time)
 
-            if self.train_flag == 0:
-                num_patch_tokens = self.num_video_query_token
-                img_embeds, atts_img = self.encode_videoQformer_visual(image)
-            elif self.train_flag == 1:
-                num_patch_tokens = self.num_audio_query_token
-                image = einops.rearrange(image, 'b c t h w -> b t c h w')
-                img_embeds, atts_img = self.encode_audioQformer(image, modality_type=ModalityType.VISION)
-                
+            embs = []
+            chunks = torch.split(image, self.L, dim=2)
+            new_video = True
+            for chunk in chunks:
+                if self.train_flag == 0:
+                    num_patch_tokens = self.num_video_query_token
+                    img_embeds, atts_img = self.encode_videoQformer_visual(chunk, new_video)
+                    embs.append(img_embeds)
+                    print(img_embeds.shape)
+                elif self.train_flag == 1:
+                    num_patch_tokens = self.num_audio_query_token
+                    image = einops.rearrange(image, 'b c t h w -> b t c h w')
+                    img_embeds, atts_img = self.encode_audioQformer(chunk, modality_type=ModalityType.VISION, new_video=new_video)
+                    embs.append(img_embeds)
+                new_video=False
+            
+            embs = torch.stack(embs).view(img_embeds.shape[0], len(chunks), img_embeds.shape[1]*img_embeds.shape[2]) 
+            img_embeds = self.hopfield_pooling(embs).view(img_embeds.shape[0], img_embeds.shape[1], img_embeds.shape[2] )
             temp_input_ids = copy.deepcopy(input_ids)
             temp_input_ids[temp_input_ids == im_patch_token_id] = 0
             temp_input_embedding = self.llama_model.model.embed_tokens(temp_input_ids)
@@ -535,7 +584,7 @@ class VideoLLAMA(Blip2Base):
             loss = outputs.loss
 
         return {"loss": loss}
-
+    
     @classmethod
     def from_config(cls, cfg):
         vit_model = cfg.get("vit_model", "eva_clip_g")
@@ -571,6 +620,11 @@ class VideoLLAMA(Blip2Base):
         equip_audio_branch= cfg.get("equip_audio_branch", True)
         num_audio_query_token =  cfg.get("num_audio_query_token", 8)
         imagebind_ckpt_path = cfg.get("imagebind_ckpt_path", '/mnt/workspace/ckpt')
+        num_basis =  cfg.get("num_basis", 256)
+        sticky =  cfg.get("sticky", True)
+        sigmas =  cfg.get("sigmas", [0.005, 0.01])
+        tau =  cfg.get("tau", 0.75)
+        short_term_memory_length = cfg.get("L", 512)
         model = cls(
             vit_model=vit_model,
             q_former_model=q_former_model,
@@ -598,7 +652,12 @@ class VideoLLAMA(Blip2Base):
             num_audio_query_token = num_audio_query_token,
             imagebind_ckpt_path = imagebind_ckpt_path,
             equip_audio_branch = equip_audio_branch,
-            llama_proj_model = llama_proj_model
+            llama_proj_model = llama_proj_model,
+            num_basis = num_basis,
+            sticky=sticky,
+            sigmas = sigmas,
+            tau = tau,
+            short_term_memory_length=short_term_memory_length
         )
 
         ckpt_path = cfg.get("ckpt", "")  # load weights of MiniGPT-4
